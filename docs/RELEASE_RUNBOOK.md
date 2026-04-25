@@ -42,6 +42,7 @@ Current packaging note:
 Run these from the repository root before cutting a tag:
 
 ```bash
+./scripts/release/check-versions.sh   # version drift between workspace, npm, lockfile
 cargo fmt --all -- --check
 cargo check --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
@@ -49,6 +50,11 @@ cargo test --workspace --all-features --locked
 cargo publish --dry-run --locked --allow-dirty -p deepseek-tui
 ./scripts/release/publish-crates.sh dry-run
 ```
+
+`check-versions.sh` also runs in CI on every push/PR (the `versions` job in
+`.github/workflows/ci.yml`), so drift between `Cargo.toml`, the per-crate
+manifests, `npm/deepseek-tui/package.json`, and `Cargo.lock` is caught before
+release time rather than at it.
 
 `publish-crates.sh dry-run` performs a full `cargo publish --dry-run` for crates
 without unpublished workspace dependencies and a packaging preflight for dependent
