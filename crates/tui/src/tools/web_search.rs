@@ -1,7 +1,7 @@
-//! Compatibility web search helper backed by DuckDuckGo HTML results.
+//! Web search tool backed by DuckDuckGo HTML results (with Bing fallback).
 //!
-//! Prefer `web.run` for new browsing calls. This legacy surface remains available
-//! for older prompts and configs that still reference `web_search`.
+//! This is the primary web search surface for agents. For browsing workflows
+//! (page open, click, screenshot) use a direct URL approach instead.
 
 use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec, optional_u64,
@@ -93,7 +93,7 @@ impl ToolSpec for WebSearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Compatibility web search helper. Prefer web.run for canonical browsing workflows."
+        "Search the web using DuckDuckGo or Bing and return structured results with URLs and snippets."
     }
 
     fn input_schema(&self) -> Value {
@@ -106,11 +106,11 @@ impl ToolSpec for WebSearchTool {
                 },
                 "q": {
                     "type": "string",
-                    "description": "Search query alias accepted for compatibility with web.run-style calls."
+                    "description": "Search query."
                 },
                 "search_query": {
                     "type": "array",
-                    "description": "Compatibility form from web.run: [{\"q\":\"...\", \"max_results\": 5}]",
+                    "description": "Array form for advanced queries: [{\"q\":\"...\", \"max_results\": 5}]",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -510,9 +510,9 @@ mod tests {
     }
 
     #[test]
-    fn extract_search_query_accepts_web_run_shape() {
+    fn extract_search_query_accepts_array_form() {
         let input = json!({"search_query": [{"q": "deepseek api", "max_results": 3}]});
-        let query = extract_search_query(&input).expect("web.run shape should parse");
+        let query = extract_search_query(&input).expect("array form should parse");
         assert_eq!(query, "deepseek api");
         assert_eq!(optional_search_max_results(&input), 3);
     }
