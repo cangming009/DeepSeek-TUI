@@ -1684,6 +1684,12 @@ fn map_tool_choice_for_chat(choice: &Value) -> Option<Value> {
 /// carries `tool_calls`, when the model + effort combination requires it.
 /// DeepSeek's thinking-mode API rejects such messages with a 400 error;
 /// substituting a placeholder keeps the conversation chain intact.
+///
+/// Also tallies the size of all replayed `reasoning_content` and logs it, so
+/// users on `RUST_LOG=deepseek_tui=debug` can see how much of their input
+/// budget is being spent re-sending prior thinking traces (V4 §5.1.1
+/// "Interleaved Thinking" requires the full trace to be replayed across user
+/// message boundaries in tool-calling sessions).
 fn sanitize_thinking_mode_messages(body: &mut Value, model: &str, effort: Option<&str>) {
     if !should_replay_reasoning_content(model, effort) {
         return;
@@ -1692,6 +1698,8 @@ fn sanitize_thinking_mode_messages(body: &mut Value, model: &str, effort: Option
         return;
     };
     let mut substitutions: u32 = 0;
+    let mut replay_chars: u64 = 0;
+    let mut replay_messages: u32 = 0;
     for (idx, msg) in messages.iter_mut().enumerate() {
         if msg.get("role").and_then(Value::as_str) != Some("assistant") {
             continue;
@@ -1707,12 +1715,43 @@ fn sanitize_thinking_mode_messages(body: &mut Value, model: &str, effort: Option
                 "Final sanitizer: forced reasoning_content placeholder on assistant[{idx}]",
             ));
         }
+        if let Some(reasoning) = msg.get("reasoning_content").and_then(Value::as_str) {
+            let len = reasoning.len() as u64;
+            if len > 0 {
+                replay_chars = replay_chars.saturating_add(len);
+                replay_messages = replay_messages.saturating_add(1);
+            }
+        }
     }
     if substitutions > 0 {
         logging::warn(format!(
             "Final sanitizer: {substitutions} assistant message(s) needed reasoning_content placeholder",
         ));
     }
+    if replay_messages > 0 {
+        // ~4 chars/token is the standard rough estimate; DeepSeek tokens skew
+        // a touch shorter on Chinese/code but this is order-of-magnitude info.
+        let approx_tokens = replay_chars / 4;
+        logging::info(format!(
+            "Reasoning-content replay: {replay_messages} assistant message(s), ~{approx_tokens} input tokens ({replay_chars} chars) being re-sent in this request",
+        ));
+    }
+}
+
+/// Sums the byte length of `reasoning_content` across all assistant messages in
+/// an outgoing chat-completions body. Used by tests; the production sanitizer
+/// computes the same number inline and logs it.
+#[cfg(test)]
+fn count_reasoning_replay_chars(body: &Value) -> u64 {
+    let Some(messages) = body.get("messages").and_then(Value::as_array) else {
+        return 0;
+    };
+    messages
+        .iter()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        .filter_map(|m| m.get("reasoning_content").and_then(Value::as_str))
+        .map(|s| s.len() as u64)
+        .sum()
 }
 
 /// Diagnostic logger fired when DeepSeek rejects the request despite the
@@ -3393,6 +3432,80 @@ mod tests {
         assert_eq!(usage.prompt_cache_hit_tokens, Some(70));
         assert_eq!(usage.prompt_cache_miss_tokens, Some(30));
         assert_eq!(usage.reasoning_tokens, Some(12));
+    }
+
+    #[test]
+    fn sanitize_thinking_mode_counts_reasoning_replay_across_assistant_turns() {
+        // Multi-turn body that mimics two prior tool-calling rounds: each
+        // assistant message carries its `reasoning_content`. The sanitizer
+        // should keep all of them and the count helper should tally bytes
+        // across every assistant message.
+        let mut body = json!({
+            "model": "deepseek-v4-pro",
+            "messages": [
+                { "role": "system", "content": "you are helpful" },
+                { "role": "user", "content": "step 1" },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "I need to call tool A first.",
+                    "tool_calls": [{ "id": "1", "type": "function" }]
+                },
+                { "role": "tool", "tool_call_id": "1", "content": "ok" },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "Now I call tool B.",
+                    "tool_calls": [{ "id": "2", "type": "function" }]
+                },
+                { "role": "tool", "tool_call_id": "2", "content": "ok" },
+                { "role": "user", "content": "step 2" }
+            ]
+        });
+
+        sanitize_thinking_mode_messages(&mut body, "deepseek-v4-pro", Some("max"));
+
+        let chars = count_reasoning_replay_chars(&body);
+        // "I need to call tool A first." (28) + "Now I call tool B." (18) = 46
+        assert_eq!(chars, 46);
+
+        // No assistant messages should have lost or had their reasoning_content blanked.
+        let messages = body["messages"].as_array().unwrap();
+        let assistant_with_reasoning: usize = messages
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .filter(|m| {
+                m["reasoning_content"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+            })
+            .count();
+        assert_eq!(assistant_with_reasoning, 2);
+    }
+
+    #[test]
+    fn sanitize_thinking_mode_counts_substituted_placeholder() {
+        // An assistant tool-call message is missing reasoning_content; the
+        // sanitizer must inject the placeholder, and the count helper must
+        // include the placeholder in the total (since it's in the wire
+        // payload that ships to DeepSeek).
+        let mut body = json!({
+            "model": "deepseek-v4-pro",
+            "messages": [
+                { "role": "user", "content": "hi" },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{ "id": "1", "type": "function" }]
+                }
+            ]
+        });
+
+        sanitize_thinking_mode_messages(&mut body, "deepseek-v4-pro", Some("max"));
+
+        let chars = count_reasoning_replay_chars(&body);
+        // "(reasoning omitted)" is 19 bytes.
+        assert_eq!(chars, 19);
     }
 
     #[test]
