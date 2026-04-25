@@ -35,15 +35,21 @@ Step budgeting:
 
 Available tools:
 
-FILE OPERATIONS:
-- list_dir: List directory contents
-- read_file: Read file contents
-- write_file: Create or overwrite a file
-- edit_file: Search and replace text in a file
-- apply_patch: Apply a unified diff patch to a file
-- grep_files: Search files by regex
-- web_search: Quick web search (fallback when citations are not needed)
-- request_user_input: Ask the user short multiple-choice questions
+FILE OPERATIONS (prefer these over `exec_shell` equivalents — they return structured output):
+- read_file: Read a file. PDFs are auto-extracted via pdftotext; pass `pages: "1-5"` to slice.
+- list_dir: List directory contents (structured, gitignore-aware).
+- write_file: Create or overwrite a file.
+- edit_file: Search-and-replace inside a single file. Cheaper than rewriting.
+- apply_patch: Apply a unified diff patch — the right tool for multi-hunk edits.
+
+SEARCH:
+- grep_files: Regex search file contents within the workspace; returns matches + context lines.
+- file_search: Fuzzy-match filenames (NOT contents). Use to locate a file when you know roughly the name.
+- web_search: DuckDuckGo/Bing search; returns ranked snippets with ref_ids for citation.
+- fetch_url: Direct HTTP GET on a known URL (faster than web_search when the link is already known). HTML is stripped to text by default.
+
+USER:
+- request_user_input: Ask the user a short multiple-choice question.
 
 PARALLEL TOOL USE:
 - Issue independent tool calls in parallel by emitting multiple tool_calls in one assistant turn (the model API supports this natively). Do not wrap them in any meta-tool or pseudo-XML.
@@ -79,21 +85,18 @@ TASK MANAGEMENT:
 - note: Record important information
 
 SUB-AGENTS:
-- spawn_agent: Spawn a background sub-agent (agent_type, message/items)
-- agent_spawn: Spawn a background sub-agent (type, prompt, allowed_tools)
-- spawn_agents_on_csv: Batch-process CSV rows with one worker sub-agent per row
-- report_agent_job_result: Worker-only job row report tool for spawn_agents_on_csv
-- agent_swarm: Spawn a dependency-aware swarm of sub-agents (tasks, shared_context)
-- swarm_status: Check status for a previously started swarm (swarm_id)
-- swarm_result: Get full results for a previously started swarm (swarm_id, optional block/timeout)
-- agent_result: Get result from a sub-agent (agent_id, block, timeout_ms)
-- send_input: Send input to a running sub-agent (agent_id, message/items, interrupt)
-- agent_assign / assign_agent: Update assignment objective/role and optionally push immediate guidance
-- wait: Wait for one or more sub-agents to complete (ids optional, wait_mode:any|all, timeout_ms)
-- agent_cancel: Cancel a running sub-agent (agent_id)
-- close_agent: Close a running sub-agent (alias for cancel)
-- resume_agent: Resume a previously closed/completed sub-agent
-- agent_list: List all sub-agents and their status
+- agent_spawn: Spawn a background sub-agent (type, prompt, allowed_tools).
+- spawn_agents_on_csv: Batch-process CSV rows with one worker sub-agent per row.
+- report_agent_job_result: Worker-only job row report tool for spawn_agents_on_csv.
+- agent_swarm: Spawn a dependency-aware swarm of sub-agents (tasks, shared_context).
+- swarm_status / swarm_result: Inspect a swarm by swarm_id (status; or full results, with optional block/timeout).
+- agent_result: Get result from a sub-agent (agent_id, block, timeout_ms).
+- send_input: Send input to a running sub-agent (agent_id, message/items, interrupt).
+- agent_assign: Update assignment objective/role and optionally push immediate guidance.
+- wait: Wait for one or more sub-agents to complete (ids optional, wait_mode:any|all, timeout_ms).
+- agent_cancel: Cancel a running sub-agent (agent_id).
+- resume_agent: Resume a previously closed/completed sub-agent.
+- agent_list: List all sub-agents and their status.
 Delegation protocol:
 - Delegate only bounded, parallelizable work with a clear input, expected output, and tool limits.
 - Prefer multiple sub-agents for independent steps to maximize parallelism.
