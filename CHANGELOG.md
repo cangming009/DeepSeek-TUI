@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-04-25
+
+### Added
+- **`fetch_url` tool** for direct HTTP GET on a known URL — complements `web_search` for cases where the link is already known. Supports `format` (`markdown` / `text` / `raw`), `max_bytes` (default 1 MB, hard cap 10 MB), `timeout_ms` (default 15 s, max 60 s), redirect following, and structured `{url, status, content_type, content, truncated}` responses. 4xx/5xx bodies are returned (with `success: false`) so the caller can read JSON error envelopes. (#33)
+- **PDF support in `read_file`.** PDFs are auto-detected by extension or `%PDF-` magic bytes and extracted via `pdftotext -layout` (poppler) when available. New optional `pages` arg (`"5"` or `"1-10"`) reads page slices. Without `pdftotext`, returns a structured `{type: "binary_unavailable", kind: "pdf", reason, hint}` with install commands for macOS/Debian. (#34)
+- **Reasoning-content replay telemetry, end-to-end (#30).** The chat-completions sanitizer now estimates replayed `reasoning_content` tokens (~4 chars/token), threads the value through the streaming `Usage` payload, stores it on the App, and renders an `rsn N.Nk` chip in the footer next to the cache hit-rate. The chip turns warning-coloured when replay tokens exceed 50% of the input budget, so users on long thinking-mode loops can see at a glance how much of their context window is going to V4's "Interleaved Thinking" replay (paper §5.1.1). Logged at `RUST_LOG=deepseek_tui=info` for tail-friendly diagnosis.
+- **`@file` Tab-completion (#28).** Typing `@<partial>` and pressing Tab now resolves the mention against the workspace using the existing `ignore::WalkBuilder`. A unique match is spliced into the input; multiple matches with a longer common prefix extend the partial; remaining ambiguity is surfaced via the status line. The mention-expansion path that ships file contents to the model is unchanged — this is purely a discovery aid for typing the path. Inline-contents and a fuzzy popup picker are queued for v0.5.2.
+- **Per-workspace external trust list (#29).** `~/.deepseek/workspace-trust.json` now records, for each workspace, the absolute paths the user has opted into reading/writing from outside that workspace. The new `/trust` slash command supports `add <path>`, `remove <path>`, `list`, `on`, `off`, and a status read with no args; the engine consults the list when constructing every `ToolContext` so changes apply on the next tool call without restart. `/diagnostics` surfaces the list. The interactive "Allow once / Always allow / Deny" approval prompt is deferred — for now grant access ahead of the turn with `/trust add <path>`.
+
+### Fixed
+- **TUI sidebar gutter bleed regression test (#36).** Snapshot tests now lock in that long single-line tool results — including a `todo_write` echo of a multi-kilobyte JSON payload — never write any cells outside `chat_area` at the widths reported in the bug (80, 120, 165, 200 cols). A second test verifies the scrollbar coexists with content along the right edge instead of overdrawing the penultimate column.
+- **Version drift caught in CI.** New `versions` job in `.github/workflows/ci.yml` runs `scripts/release/check-versions.sh` on every push/PR, verifying every per-crate `Cargo.toml` inherits the workspace version, the npm wrapper matches the workspace version, and `Cargo.lock` is in sync. The release runbook now lists `check-versions.sh` as the first preflight step. (#31)
+- **Per-mode soft context budget for V4 compaction trigger** (#27).
+- **Phantom `web.run` references stripped** from prompts and the `web_search` tool surface (#25).
+- **Unused import + `cargo fmt` drift** that landed with `feat(#27)` and broke Build / Test / npm wrapper smoke under `-Dwarnings`.
+
 ## [0.5.0] - 2026-04-25
 
 ### Fixed
