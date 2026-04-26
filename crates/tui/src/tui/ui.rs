@@ -3087,16 +3087,30 @@ fn render_footer(f: &mut Frame, area: Rect, app: &mut App) {
     // Animate the spacer between the left status line and the right-hand
     // chips whenever a turn is live: model loading/streaming, compacting, or
     // sub-agents in flight. Honors the `low_motion` setting — calm terminals
-    // get the plain whitespace gap. Frame counter ticks every 80 ms; the
-    // renderer is deterministic given the frame, so tests can pin specific
-    // frames. Computed independently of `state_label` so removing the
-    // "thinking" text label doesn't kill the visual signal.
-    if !app.low_motion && footer_working_strip_active(app) {
-        let frame = std::time::SystemTime::now()
+    // get the plain whitespace gap. Strip frame counter ticks every 80 ms;
+    // dot-pulse counter ticks every 400 ms so `working` → `working...` reads
+    // at a calm pace. The renderer is deterministic given the frame.
+    if footer_working_strip_active(app) {
+        let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64 / 80)
+            .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        props.working_strip_frame = Some(frame);
+        let dot_frame = now_ms / 400;
+        // Surface a `working`-with-dot-pulse label whenever a turn is live.
+        // This replaces the plain "working" / no-label state for the
+        // duration of the turn so the user always has a textual signal,
+        // even on terminals where the spout strip is disabled.
+        let working_label = crate::tui::widgets::footer_working_label(dot_frame);
+        props.state_label = working_label;
+        props.state_color = palette::DEEPSEEK_SKY;
+
+        // Spout drift: only animate when low_motion is off. The textual
+        // `working...` pulse stays even in low-motion mode so the user still
+        // sees that something is happening.
+        if !app.low_motion {
+            let strip_frame = now_ms / 80;
+            props.working_strip_frame = Some(strip_frame);
+        }
     }
 
     let widget = FooterWidget::new(props);

@@ -61,28 +61,46 @@ pub struct FooterProps {
 /// frame counter. Returns the glyph that should appear in that cell on that
 /// frame.
 ///
-/// Visual: a single calm water line of `─` with one upward spout glyph that
-/// drifts back and forth via a triangle-wave bounce. Minimal, artistic, and
-/// purely deterministic so the test suite can pin a specific frame.
+/// Visual: two box-drawing "arcs" (`╭───╮`) sweeping horizontally at
+/// independent speeds across a calm water surface (`─`). Arcs that meet
+/// blend into a wider arch, giving the criss-cross fountain feel. Purely
+/// deterministic given (col, width, frame) so unit tests can pin frames.
 #[must_use]
 pub fn footer_working_strip_glyph_at(col: usize, width: usize, frame: u64) -> char {
     if width == 0 {
         return ' ';
     }
-    let w = width as i64;
+
+    // Half-width of an arc (so a full arc spans `2*ARC_HALF + 1` columns:
+    // `╭`, `─`...`─`, `╮`). Three keeps the arcs `╭───╮` — five glyphs wide,
+    // matching the issue's sketch.
+    const ARC_HALF: i64 = 2;
+    let arc_span = ARC_HALF * 2 + 1; // 5
+
+    // Two arcs at independent speeds drifting through a wrap-around span
+    // wider than the strip itself, so each arc enters from the left, sweeps
+    // across, and exits on the right before re-entering. Phase offsets keep
+    // them from synchronising at frame 0.
+    let cycle = (width as i64).max(arc_span) + arc_span * 2;
     let frame = frame as i64;
+    let pos1 = (frame).rem_euclid(cycle) - arc_span;
+    let pos2 = (frame * 2 + (cycle / 3) + 7).rem_euclid(cycle) - arc_span;
 
-    // Bounce a value that counts up forever between [0, w-1] using a
-    // triangle wave so the spout rides back and forth instead of wrapping.
-    let span = (w * 2).max(2);
-    let t = frame.rem_euclid(span);
-    let pos = if t < w { t } else { (span - 1) - t };
+    arc_glyph_for(col as i64, pos1)
+        .or_else(|| arc_glyph_for(col as i64, pos2))
+        .unwrap_or('\u{2500}') // ─  — calm water surface
+}
 
-    let dist = (col as i64 - pos).abs();
+/// Helper: returns the glyph for column `col` if it falls inside an arc
+/// centred at `pos`, else `None`. An arc is `╭───╮` shaped — left cup, three
+/// dashes, right cup — five columns wide.
+fn arc_glyph_for(col: i64, pos: i64) -> Option<char> {
+    let dist = col - pos;
     match dist {
-        0 => '\u{257F}', // ╿  — vertical bar with a stronger top half: a spout standing up out of the surface
-        1 => '\u{2576}', // ╶  — short stub on the spout's shoulder, like a splash
-        _ => '\u{2500}', // ─  — calm water surface
+        -2 => Some('\u{256D}'),     // ╭  arc rising from the left
+        -1..=1 => Some('\u{2500}'), // ─  arc top
+        2 => Some('\u{256E}'),      // ╮  arc falling on the right
+        _ => None,
     }
 }
 
@@ -95,6 +113,22 @@ pub fn footer_working_strip_string(width: usize, frame: u64) -> String {
     let mut out = String::with_capacity(width * 4);
     for col in 0..width {
         out.push(footer_working_strip_glyph_at(col, width, frame));
+    }
+    out
+}
+
+/// Pulse `working` through `working`, `working.`, `working..`, `working...`
+/// keyed off `frame`. The cycle period is 4 frames (matching the four
+/// states), so adjacent ticks visibly differ. Returns a static-friendly
+/// `String` so callers can drop it into a `Span::styled` without lifetime
+/// gymnastics.
+#[must_use]
+pub fn footer_working_label(frame: u64) -> String {
+    let dots = (frame % 4) as usize;
+    let mut out = String::with_capacity(7 + dots);
+    out.push_str("working");
+    for _ in 0..dots {
+        out.push('.');
     }
     out
 }
@@ -553,8 +587,8 @@ mod tests {
     #[test]
     fn working_strip_renders_glyphs_only_when_frame_is_some() {
         // Idle: spacer is plain whitespace. Active: spacer contains the
-        // box-drawing animation glyphs (`╿` spout, `╶` splash, `─` water
-        // surface) and visibly differs from the idle render.
+        // box-drawing animation glyphs (`╭` rising-arc, `╮` falling-arc,
+        // `─` water surface) and visibly differs from the idle render.
         let app = make_app();
         let mut props = idle_props_for(&app);
 
@@ -573,24 +607,61 @@ mod tests {
             "active footer must visibly differ from idle one"
         );
         assert!(
-            active.contains('\u{257F}')
-                || active.contains('\u{2576}')
-                || active.contains('\u{2500}'),
+            active.contains('\u{256D}')   // ╭
+                || active.contains('\u{256E}') // ╮
+                || active.contains('\u{2500}'), // ─
             "active strip must contain at least one animation glyph: {active:?}",
         );
     }
 
     #[test]
-    fn working_strip_spout_position_advances_with_frame() {
-        // The single spout column must move between consecutive frames so
-        // the animation reads as drift rather than a static pattern.
-        let width = 16;
+    fn working_strip_arc_position_advances_with_frame() {
+        // At least one arc cup (╭) must shift columns between consecutive
+        // frames so the animation reads as drift, not a static pattern.
+        let width = 32;
         let f0 = super::footer_working_strip_string(width, 1);
         let f1 = super::footer_working_strip_string(width, 2);
-        let pos = |s: &str| s.chars().position(|c| c == '\u{257F}');
-        let p0 = pos(&f0).expect("frame 1 has a spout");
-        let p1 = pos(&f1).expect("frame 2 has a spout");
-        assert_ne!(p0, p1, "spout column must advance between frames");
+        // Collect the columns that hold a left-arc `╭` glyph in each frame.
+        let cups = |s: &str| -> Vec<usize> {
+            s.chars()
+                .enumerate()
+                .filter_map(|(i, c)| (c == '\u{256D}').then_some(i))
+                .collect()
+        };
+        let p0 = cups(&f0);
+        let p1 = cups(&f1);
+        assert_ne!(p0, p1, "arc cup positions must advance between frames");
+    }
+
+    #[test]
+    fn working_strip_renders_full_arc_when_room() {
+        // A frame at which arc 1 is fully inside the strip should render
+        // the canonical `╭───╮` shape — the artistic centrepiece of the
+        // animation. Arc 1's leading edge starts at `frame % cycle - 5`,
+        // so frame == 5 puts the arc's left cup exactly at column 0.
+        // (See `footer_working_strip_glyph_at` for the math.)
+        let s = super::footer_working_strip_string(40, 5);
+        assert!(
+            s.contains("\u{256D}\u{2500}\u{2500}\u{2500}\u{256E}"),
+            "expected ╭───╮ arc somewhere in the strip: {s:?}",
+        );
+    }
+
+    #[test]
+    fn working_label_pulses_dots_through_full_cycle() {
+        // The label sequence `working` → `working.` → `working..` →
+        // `working...` then wraps back. Each frame is a discrete tick;
+        // the cycle is exactly 4 frames so adjacent ticks visibly differ.
+        assert_eq!(super::footer_working_label(0), "working");
+        assert_eq!(super::footer_working_label(1), "working.");
+        assert_eq!(super::footer_working_label(2), "working..");
+        assert_eq!(super::footer_working_label(3), "working...");
+        assert_eq!(
+            super::footer_working_label(4),
+            "working",
+            "wraps back at frame 4",
+        );
+        assert_eq!(super::footer_working_label(7), "working...");
     }
 
     #[test]
