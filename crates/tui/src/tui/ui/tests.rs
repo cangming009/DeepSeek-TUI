@@ -1613,3 +1613,164 @@ fn mark_history_updated_does_not_call_scroll_to_bottom() {
         "mark_history_updated must not scroll",
     );
 }
+
+// ---- P2.3: thinking + tool calls render as one grouped block ----
+
+#[test]
+fn thinking_then_tools_share_active_cell_until_text_flushes() {
+    // Contract: a turn that emits Thinking → Tool → Tool keeps everything
+    // inside `active_cell` (one logical "Working…" group) until the next
+    // assistant prose chunk fires, at which point the group flushes into
+    // history in original order.
+    let mut app = create_test_app();
+
+    // 1. Thinking starts and streams a delta.
+    let thinking_idx = ensure_streaming_thinking_active_entry(&mut app);
+    append_streaming_thinking(&mut app, thinking_idx, "planning the read");
+    assert!(
+        app.history.is_empty(),
+        "thinking must not write into history mid-turn"
+    );
+    assert_eq!(thinking_idx, 0);
+
+    // 2. Two tool calls land in the same active cell.
+    handle_tool_call_started(
+        &mut app,
+        "t-1",
+        "exec_shell",
+        &serde_json::json!({"command": "ls"}),
+    );
+    handle_tool_call_started(
+        &mut app,
+        "t-2",
+        "exec_shell",
+        &serde_json::json!({"command": "pwd"}),
+    );
+
+    let active = app
+        .active_cell
+        .as_ref()
+        .expect("active cell present mid-turn");
+    assert_eq!(
+        active.entry_count(),
+        3,
+        "thinking + two exec entries share one active cell"
+    );
+    assert!(matches!(active.entries()[0], HistoryCell::Thinking { .. }));
+    assert!(matches!(
+        active.entries()[1],
+        HistoryCell::Tool(ToolCell::Exec(_))
+    ));
+    assert!(matches!(
+        active.entries()[2],
+        HistoryCell::Tool(ToolCell::Exec(_))
+    ));
+
+    // 3. Thinking finalizes — entry stays in active cell, just stops streaming.
+    let finalized = finalize_streaming_thinking_active_entry(&mut app, Some(1.5), "");
+    assert!(finalized, "finalizer reports it touched the active cell");
+    let HistoryCell::Thinking {
+        streaming,
+        duration_secs,
+        content,
+        ..
+    } = &app
+        .active_cell
+        .as_ref()
+        .expect("active cell still present after thinking complete")
+        .entries()[0]
+    else {
+        panic!("expected thinking entry")
+    };
+    assert!(!streaming, "thinking spinner stops after finalize");
+    assert_eq!(*duration_secs, Some(1.5));
+    assert_eq!(content, "planning the read");
+    assert!(
+        app.streaming_thinking_active_entry.is_none(),
+        "stream pointer cleared after finalize"
+    );
+
+    // 4. Assistant prose arriving (simulated by flush) drains the group into
+    //    history in original order: Thinking → Tool → Tool.
+    app.flush_active_cell();
+    assert!(app.active_cell.is_none(), "active cell cleared after flush");
+    assert_eq!(
+        app.history.len(),
+        3,
+        "thinking + both tool entries land in history together"
+    );
+    assert!(matches!(app.history[0], HistoryCell::Thinking { .. }));
+    assert!(matches!(
+        app.history[1],
+        HistoryCell::Tool(ToolCell::Exec(_))
+    ));
+    assert!(matches!(
+        app.history[2],
+        HistoryCell::Tool(ToolCell::Exec(_))
+    ));
+}
+
+#[test]
+fn flush_active_cell_finalizes_unclosed_thinking_block() {
+    // Defensive: if the engine fails to emit ThinkingComplete before the
+    // assistant text arrives, `flush_active_cell` must still stop the
+    // spinner so the migrated history cell isn't perpetually streaming.
+    let mut app = create_test_app();
+    let _ = ensure_streaming_thinking_active_entry(&mut app);
+    append_streaming_thinking(&mut app, 0, "incomplete");
+
+    app.flush_active_cell();
+
+    assert_eq!(app.history.len(), 1);
+    let HistoryCell::Thinking { streaming, .. } = &app.history[0] else {
+        panic!("expected thinking history cell")
+    };
+    assert!(
+        !*streaming,
+        "flush must stop the spinner even without ThinkingComplete"
+    );
+    assert!(
+        app.streaming_thinking_active_entry.is_none(),
+        "stream pointer cleared by flush"
+    );
+}
+
+#[test]
+fn second_thinking_block_appends_new_entry_in_same_active_cell() {
+    // Real V4 turns can emit Thinking → Tool → Thinking → Tool before any
+    // prose; the second thinking block should land as a fresh entry inside
+    // the SAME active cell rather than flush the first group prematurely.
+    let mut app = create_test_app();
+
+    let _ = ensure_streaming_thinking_active_entry(&mut app);
+    append_streaming_thinking(&mut app, 0, "first plan");
+    let _ = finalize_streaming_thinking_active_entry(&mut app, Some(0.5), "");
+
+    handle_tool_call_started(
+        &mut app,
+        "t-1",
+        "exec_shell",
+        &serde_json::json!({"command": "ls"}),
+    );
+
+    // Second Thinking block.
+    let second_idx = ensure_streaming_thinking_active_entry(&mut app);
+    assert_eq!(
+        second_idx, 2,
+        "second thinking entry follows the tool entry"
+    );
+    append_streaming_thinking(&mut app, second_idx, "second plan");
+
+    let active = app.active_cell.as_ref().expect("active cell present");
+    assert_eq!(active.entry_count(), 3);
+    assert!(matches!(active.entries()[0], HistoryCell::Thinking { .. }));
+    assert!(matches!(
+        active.entries()[1],
+        HistoryCell::Tool(ToolCell::Exec(_))
+    ));
+    assert!(matches!(active.entries()[2], HistoryCell::Thinking { .. }));
+    assert!(
+        app.history.is_empty(),
+        "the group still hasn't flushed — no prose yet"
+    );
+}

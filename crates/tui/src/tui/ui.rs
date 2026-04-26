@@ -370,8 +370,7 @@ async fn run_event_loop(
                             app.flush_active_cell();
                         }
                         current_streaming_text.push_str(&sanitized);
-                        let index =
-                            ensure_streaming_history_cell(app, StreamingCellKind::Assistant);
+                        let index = ensure_streaming_assistant_history_cell(app);
                         app.streaming_state.push_content(0, &sanitized);
                         let committed = app.streaming_state.commit_text(0);
                         if !committed.is_empty() {
@@ -430,15 +429,15 @@ async fn run_event_loop(
                         }
                     }
                     EngineEvent::ThinkingStarted { .. } => {
-                        // A fresh thinking block after parallel tools means
-                        // that batch is done; settle it into history.
-                        app.flush_active_cell();
+                        // P2.3: thinking lives in the active cell so it groups
+                        // visually with the tool calls that follow until the
+                        // next assistant prose chunk flushes the group.
                         app.reasoning_buffer.clear();
                         app.reasoning_header = None;
                         app.thinking_started_at = Some(Instant::now());
                         app.streaming_state.reset();
                         app.streaming_state.start_thinking(0, None);
-                        let _ = ensure_streaming_history_cell(app, StreamingCellKind::Thinking);
+                        let _ = ensure_streaming_thinking_active_entry(app);
                     }
                     EngineEvent::ThinkingDelta { content, .. } => {
                         let sanitized = sanitize_stream_chunk(&content);
@@ -450,11 +449,11 @@ async fn run_event_loop(
                             app.reasoning_header = extract_reasoning_header(&app.reasoning_buffer);
                         }
 
-                        let index = ensure_streaming_history_cell(app, StreamingCellKind::Thinking);
+                        let entry_idx = ensure_streaming_thinking_active_entry(app);
                         app.streaming_state.push_content(0, &sanitized);
                         let committed = app.streaming_state.commit_text(0);
                         if !committed.is_empty() {
-                            append_streaming_text(app, index, &committed);
+                            append_streaming_thinking(app, entry_idx, &committed);
                             transcript_batch_updated = true;
                         }
                     }
@@ -463,20 +462,8 @@ async fn run_event_loop(
                             .thinking_started_at
                             .take()
                             .map(|t| t.elapsed().as_secs_f32());
-                        if let Some(index) = app.streaming_message_index.take() {
-                            let remaining = app.streaming_state.finalize_block_text(0);
-                            if !remaining.is_empty() {
-                                append_streaming_text(app, index, &remaining);
-                            }
-                            if let Some(HistoryCell::Thinking {
-                                streaming,
-                                duration_secs,
-                                ..
-                            }) = app.history.get_mut(index)
-                            {
-                                *streaming = false;
-                                *duration_secs = duration;
-                            }
+                        let remaining = app.streaming_state.finalize_block_text(0);
+                        if finalize_streaming_thinking_active_entry(app, duration, &remaining) {
                             transcript_batch_updated = true;
                         }
 
@@ -519,6 +506,7 @@ async fn run_event_loop(
                         current_streaming_text.clear();
                         app.streaming_state.reset();
                         app.streaming_message_index = None;
+                        app.streaming_thinking_active_entry = None;
                         app.turn_started_at = Some(Instant::now());
                         app.runtime_turn_id = Some(turn_id);
                         app.runtime_turn_status = Some("in_progress".to_string());
@@ -612,6 +600,7 @@ async fn run_event_loop(
                     EngineEvent::Error { message, .. } => {
                         app.streaming_state.reset();
                         app.streaming_message_index = None;
+                        app.streaming_thinking_active_entry = None;
                         app.add_message(HistoryCell::System {
                             content: format!("Error: {message}"),
                         });
@@ -1824,29 +1813,17 @@ fn sanitize_stream_chunk(chunk: &str) -> String {
         .collect()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamingCellKind {
-    Assistant,
-    Thinking,
-}
-
-fn ensure_streaming_history_cell(app: &mut App, kind: StreamingCellKind) -> usize {
+/// Ensure an in-flight streaming Assistant cell exists in history and return
+/// its index. Thinking cells go through `ensure_streaming_thinking_active_entry`
+/// (active cell) instead.
+fn ensure_streaming_assistant_history_cell(app: &mut App) -> usize {
     if let Some(index) = app.streaming_message_index {
         return index;
     }
-
-    let cell = match kind {
-        StreamingCellKind::Assistant => HistoryCell::Assistant {
-            content: String::new(),
-            streaming: true,
-        },
-        StreamingCellKind::Thinking => HistoryCell::Thinking {
-            content: String::new(),
-            streaming: true,
-            duration_secs: None,
-        },
-    };
-    app.add_message(cell);
+    app.add_message(HistoryCell::Assistant {
+        content: String::new(),
+        streaming: true,
+    });
     let index = app.history.len().saturating_sub(1);
     app.streaming_message_index = Some(index);
     index
@@ -1856,14 +1833,80 @@ fn append_streaming_text(app: &mut App, index: usize, text: &str) {
     if text.is_empty() {
         return;
     }
-
-    match app.history.get_mut(index) {
-        Some(HistoryCell::Assistant { content, .. })
-        | Some(HistoryCell::Thinking { content, .. }) => {
-            content.push_str(text);
-        }
-        _ => {}
+    if let Some(HistoryCell::Assistant { content, .. }) = app.history.get_mut(index) {
+        content.push_str(text);
     }
+}
+
+/// Ensure an in-flight Thinking entry exists in `active_cell` and return its
+/// entry index. If no thinking entry is currently streaming, push a fresh one.
+/// P2.3: thinking shares the active cell with subsequent tool calls so the
+/// pair render as one logical "Working…" block.
+fn ensure_streaming_thinking_active_entry(app: &mut App) -> usize {
+    if let Some(idx) = app.streaming_thinking_active_entry {
+        return idx;
+    }
+    if app.active_cell.is_none() {
+        app.active_cell = Some(ActiveCell::new());
+    }
+    let active = app.active_cell.as_mut().expect("active_cell just ensured");
+    let entry_idx = active.push_thinking(HistoryCell::Thinking {
+        content: String::new(),
+        streaming: true,
+        duration_secs: None,
+    });
+    app.streaming_thinking_active_entry = Some(entry_idx);
+    app.bump_active_cell_revision();
+    entry_idx
+}
+
+/// Append text to a streaming Thinking entry inside `active_cell`. Bumps the
+/// active-cell revision so the renderer re-draws the live tail.
+fn append_streaming_thinking(app: &mut App, entry_idx: usize, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let mutated = if let Some(active) = app.active_cell.as_mut()
+        && let Some(HistoryCell::Thinking { content, .. }) = active.entry_mut(entry_idx)
+    {
+        content.push_str(text);
+        true
+    } else {
+        false
+    };
+    if mutated {
+        app.bump_active_cell_revision();
+    }
+}
+
+/// Finalize the in-flight thinking entry in `active_cell`: append the
+/// collector's remaining buffered text, stop the spinner, and stamp the
+/// duration. Returns `true` when a thinking entry was finalized (so the
+/// dispatch loop knows the transcript was touched). No-op if no thinking
+/// entry is currently streaming.
+fn finalize_streaming_thinking_active_entry(
+    app: &mut App,
+    duration: Option<f32>,
+    remaining: &str,
+) -> bool {
+    let Some(entry_idx) = app.streaming_thinking_active_entry.take() else {
+        return false;
+    };
+    if !remaining.is_empty() {
+        append_streaming_thinking(app, entry_idx, remaining);
+    }
+    if let Some(active) = app.active_cell.as_mut()
+        && let Some(HistoryCell::Thinking {
+            streaming,
+            duration_secs,
+            ..
+        }) = active.entry_mut(entry_idx)
+    {
+        *streaming = false;
+        *duration_secs = duration;
+    }
+    app.bump_active_cell_revision();
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

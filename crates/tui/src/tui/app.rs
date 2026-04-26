@@ -505,6 +505,11 @@ pub struct App {
     pub last_exec_wait_command: Option<String>,
     /// Current streaming assistant cell
     pub streaming_message_index: Option<usize>,
+    /// Index into `active_cell.entries` of the thinking entry currently being
+    /// streamed. `None` when no thinking block is in flight. P2.3 routes
+    /// thinking into the active cell so it groups visually with tool calls
+    /// until the next assistant prose chunk flushes the group into history.
+    pub streaming_thinking_active_entry: Option<usize>,
     /// Newline-gated streaming collector state.
     pub streaming_state: StreamingState,
     /// Accumulated reasoning text
@@ -805,6 +810,7 @@ impl App {
             ignored_tool_calls: HashSet::new(),
             last_exec_wait_command: None,
             streaming_message_index: None,
+            streaming_thinking_active_entry: None,
             streaming_state: StreamingState::new(),
             reasoning_buffer: String::new(),
             reasoning_header: None,
@@ -1053,6 +1059,10 @@ impl App {
     /// [`ActiveCell::mark_in_progress_as_interrupted`]).
     pub fn flush_active_cell(&mut self) {
         let Some(mut active) = self.active_cell.take() else {
+            // Even with no active cell, the thinking-stream pointer must not
+            // outlive a flush — a stale index would point at the wrong cell
+            // after subsequent pushes.
+            self.streaming_thinking_active_entry = None;
             return;
         };
         if active.is_empty() {
@@ -1061,8 +1071,19 @@ impl App {
             self.exploring_cell = None;
             self.exploring_entries.clear();
             self.active_tool_details.clear();
+            self.streaming_thinking_active_entry = None;
             self.bump_active_cell_revision();
             return;
+        }
+
+        // P2.3 safety net: stop any still-streaming thinking spinner before
+        // the entry migrates into history. Normal flow finalizes via
+        // `ThinkingComplete`; this guards against engine misbehaviour and
+        // race conditions.
+        if let Some(entry_idx) = self.streaming_thinking_active_entry.take()
+            && let Some(HistoryCell::Thinking { streaming, .. }) = active.entry_mut(entry_idx)
+        {
+            *streaming = false;
         }
 
         let drained = active.drain();
