@@ -140,6 +140,8 @@ pub struct CapacityConfig {
     pub profile_window: Option<usize>,
     pub deepseek_v3_2_chat_prior: Option<f64>,
     pub deepseek_v3_2_reasoner_prior: Option<f64>,
+    pub deepseek_v4_pro_prior: Option<f64>,
+    pub deepseek_v4_flash_prior: Option<f64>,
     pub fallback_default_prior: Option<f64>,
 }
 
@@ -811,6 +813,8 @@ fn apply_env_overrides(config: &mut Config) {
         profile_window: None,
         deepseek_v3_2_chat_prior: None,
         deepseek_v3_2_reasoner_prior: None,
+        deepseek_v4_pro_prior: None,
+        deepseek_v4_flash_prior: None,
         fallback_default_prior: None,
     });
 
@@ -873,6 +877,16 @@ fn apply_env_overrides(config: &mut Config) {
     {
         capacity.deepseek_v3_2_reasoner_prior = Some(parsed);
     }
+    if let Ok(value) = std::env::var("DEEPSEEK_CAPACITY_PRIOR_V4_PRO")
+        && let Ok(parsed) = value.parse::<f64>()
+    {
+        capacity.deepseek_v4_pro_prior = Some(parsed);
+    }
+    if let Ok(value) = std::env::var("DEEPSEEK_CAPACITY_PRIOR_V4_FLASH")
+        && let Ok(parsed) = value.parse::<f64>()
+    {
+        capacity.deepseek_v4_flash_prior = Some(parsed);
+    }
     if let Ok(value) = std::env::var("DEEPSEEK_CAPACITY_PRIOR_FALLBACK")
         && let Ok(parsed) = value.parse::<f64>()
     {
@@ -892,6 +906,8 @@ fn apply_env_overrides(config: &mut Config) {
             && c.profile_window.is_none()
             && c.deepseek_v3_2_chat_prior.is_none()
             && c.deepseek_v3_2_reasoner_prior.is_none()
+            && c.deepseek_v4_pro_prior.is_none()
+            && c.deepseek_v4_flash_prior.is_none()
             && c.fallback_default_prior.is_none()
     }) {
         config.capacity = None;

@@ -24,6 +24,8 @@ impl Default for CapacityControllerConfig {
         let mut model_priors = HashMap::new();
         model_priors.insert("deepseek_v3_2_chat".to_string(), 3.9);
         model_priors.insert("deepseek_v3_2_reasoner".to_string(), 4.1);
+        model_priors.insert("deepseek_v4_pro".to_string(), 3.5);
+        model_priors.insert("deepseek_v4_flash".to_string(), 4.2);
 
         Self {
             enabled: true,
@@ -88,6 +90,12 @@ impl CapacityControllerConfig {
         if let Some(v) = capacity.deepseek_v3_2_reasoner_prior {
             out.model_priors
                 .insert("deepseek_v3_2_reasoner".to_string(), v);
+        }
+        if let Some(v) = capacity.deepseek_v4_pro_prior {
+            out.model_priors.insert("deepseek_v4_pro".to_string(), v);
+        }
+        if let Some(v) = capacity.deepseek_v4_flash_prior {
+            out.model_priors.insert("deepseek_v4_flash".to_string(), v);
         }
         if let Some(v) = capacity.fallback_default_prior {
             out.fallback_default = v;
@@ -460,8 +468,17 @@ pub fn decide_policy(
 }
 
 fn normalize_model_prior_key(model: &str) -> &str {
+    // Strip optional "deepseek-ai/" NIM namespace prefix before pattern matching.
+    let model = model.strip_prefix("deepseek-ai/").unwrap_or(model);
     let lower = model.to_ascii_lowercase();
-    if lower.contains("reasoner") || lower.contains("r1") {
+    // V4 variants must be checked before the generic V3/chat/reasoner branches
+    // because those branches do not contain "v4" tokens and the ordering prevents
+    // accidental cross-matches.
+    if lower.contains("v4-pro") || lower.contains("v4_pro") {
+        "deepseek_v4_pro"
+    } else if lower.contains("v4-flash") || lower.contains("v4_flash") {
+        "deepseek_v4_flash"
+    } else if lower.contains("reasoner") || lower.contains("r1") {
         "deepseek_v3_2_reasoner"
     } else if lower.contains("chat") || lower.contains("v3") {
         "deepseek_v3_2_chat"
@@ -588,6 +605,80 @@ mod tests {
         let cfg = CapacityControllerConfig::default();
         let snap = make_snapshot(0.9, true, RiskBand::High);
         assert_eq!(decide_policy(&cfg, &snap), GuardrailAction::VerifyAndReplan);
+    }
+
+    #[test]
+    fn normalize_v4_pro_variants() {
+        assert_eq!(
+            normalize_model_prior_key("deepseek-v4-pro"),
+            "deepseek_v4_pro"
+        );
+        assert_eq!(
+            normalize_model_prior_key("deepseek-v4_pro"),
+            "deepseek_v4_pro"
+        );
+        assert_eq!(
+            normalize_model_prior_key("deepseek-ai/deepseek-v4-pro"),
+            "deepseek_v4_pro"
+        );
+        assert_eq!(
+            normalize_model_prior_key("deepseek-ai/deepseek-v4_pro"),
+            "deepseek_v4_pro"
+        );
+    }
+
+    #[test]
+    fn normalize_v4_flash_variants() {
+        assert_eq!(
+            normalize_model_prior_key("deepseek-v4-flash"),
+            "deepseek_v4_flash"
+        );
+        assert_eq!(
+            normalize_model_prior_key("deepseek-v4_flash"),
+            "deepseek_v4_flash"
+        );
+        assert_eq!(
+            normalize_model_prior_key("deepseek-ai/deepseek-v4-flash"),
+            "deepseek_v4_flash"
+        );
+        assert_eq!(
+            normalize_model_prior_key("deepseek-ai/deepseek-v4_flash"),
+            "deepseek_v4_flash"
+        );
+    }
+
+    #[test]
+    fn normalize_v3_and_reasoner_unchanged() {
+        assert_eq!(
+            normalize_model_prior_key("deepseek-chat"),
+            "deepseek_v3_2_chat"
+        );
+        assert_eq!(
+            normalize_model_prior_key("deepseek-v3-chat"),
+            "deepseek_v3_2_chat"
+        );
+        assert_eq!(
+            normalize_model_prior_key("deepseek-reasoner"),
+            "deepseek_v3_2_reasoner"
+        );
+        assert_eq!(
+            normalize_model_prior_key("deepseek-r1"),
+            "deepseek_v3_2_reasoner"
+        );
+        assert_eq!(
+            normalize_model_prior_key("unknown-model"),
+            "fallback_default"
+        );
+    }
+
+    #[test]
+    fn v4_priors_loaded_into_default_config() {
+        let cfg = CapacityControllerConfig::default();
+        assert_eq!(cfg.model_priors.get("deepseek_v4_pro").copied(), Some(3.5));
+        assert_eq!(
+            cfg.model_priors.get("deepseek_v4_flash").copied(),
+            Some(4.2)
+        );
     }
 
     #[test]

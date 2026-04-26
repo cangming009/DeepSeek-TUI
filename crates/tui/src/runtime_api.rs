@@ -1546,6 +1546,8 @@ mod tests {
             profile_window: None,
             deepseek_v3_2_chat_prior: None,
             deepseek_v3_2_reasoner_prior: None,
+            deepseek_v4_pro_prior: None,
+            deepseek_v4_flash_prior: None,
             fallback_default_prior: None,
         });
         let runtime_threads: SharedRuntimeThreadManager = Arc::new(RuntimeThreadManager::open(
