@@ -20,6 +20,70 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 
+// === Error diagnostics helpers (#71) ===
+
+/// Bytes of a non-2xx response body to surface in connection errors.
+const ERROR_BODY_PREVIEW_BYTES: usize = 200;
+
+/// Mask a URL so any embedded credentials in the userinfo portion (e.g.
+/// `https://user:secret@host`) are replaced with `***`. Failures fall back to
+/// the original string so we don't lose context — we never want masking to
+/// produce an empty error.
+fn mask_url_secrets(url: &str) -> String {
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        let mut clone = parsed.clone();
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            let _ = clone.set_username("***");
+            let _ = clone.set_password(Some("***"));
+        }
+        return clone.to_string();
+    }
+    url.to_string()
+}
+
+/// Mask any obvious token-like substrings in a body excerpt before surfacing
+/// it. Conservative: replaces `Bearer <token>` and `api_key=...` shapes.
+fn redact_body_preview(body: &str) -> String {
+    let mut out = body.to_string();
+    if let Some(idx) = out.to_lowercase().find("bearer ") {
+        let tail_start = idx + "bearer ".len();
+        if tail_start < out.len() {
+            let end = out[tail_start..]
+                .find(|c: char| c.is_whitespace() || c == '"' || c == ',')
+                .map_or(out.len(), |off| tail_start + off);
+            out.replace_range(tail_start..end, "***");
+        }
+    }
+    for needle in ["api_key=", "apikey=", "api-key=", "token="] {
+        if let Some(idx) = out.to_lowercase().find(needle) {
+            let tail_start = idx + needle.len();
+            let end = out[tail_start..]
+                .find(|c: char| c.is_whitespace() || c == '&' || c == '"' || c == ',')
+                .map_or(out.len(), |off| tail_start + off);
+            out.replace_range(tail_start..end, "***");
+        }
+    }
+    out
+}
+
+/// Read up to `max_bytes` of a reqwest Response body and produce a single-line
+/// excerpt suitable for an error message. Best-effort — if the body can't be
+/// read, returns "<no body>".
+async fn bounded_body_excerpt(response: reqwest::Response, max_bytes: usize) -> String {
+    let body_text = response.text().await.unwrap_or_default();
+    if body_text.is_empty() {
+        return "<no body>".to_string();
+    }
+    let trimmed: String = body_text.chars().take(max_bytes).collect();
+    let suffix = if body_text.len() > trimmed.len() {
+        "…"
+    } else {
+        ""
+    };
+    let one_line = trimmed.replace(['\n', '\r'], " ");
+    format!("{}{}", redact_body_preview(&one_line), suffix)
+}
+
 // === Configuration Types ===
 
 /// Full MCP configuration from mcp.json
@@ -297,9 +361,25 @@ impl SseTransport {
         tx: tokio::sync::mpsc::UnboundedSender<serde_json::Value>,
         cancel_token: tokio_util::sync::CancellationToken,
     ) -> Result<()> {
-        let response = client.get(&url).send().await?;
-        if !response.status().is_success() {
-            anyhow::bail!("Failed to connect to SSE: {}", response.status());
+        let response = client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| {
+                format!(
+                    "MCP SSE connect failed (transport=http url={})",
+                    mask_url_secrets(&url),
+                )
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body_excerpt = bounded_body_excerpt(response, ERROR_BODY_PREVIEW_BYTES).await;
+            anyhow::bail!(
+                "MCP SSE rejected (transport=http url={} status={}): {}",
+                mask_url_secrets(&url),
+                status,
+                body_excerpt,
+            );
         }
 
         let mut stream = response.bytes_stream();
@@ -439,9 +519,13 @@ impl McpConnection {
                 cmd.env(key, value);
             }
 
-            let mut child = cmd
-                .spawn()
-                .with_context(|| format!("Failed to spawn MCP server '{name}'"))?;
+            let mut child = cmd.spawn().with_context(|| {
+                let env_keys: Vec<&str> = config.env.keys().map(String::as_str).collect();
+                format!(
+                    "MCP stdio spawn failed (transport=stdio server={name} cmd={command:?} args={:?} env_keys={env_keys:?})",
+                    config.args,
+                )
+            })?;
 
             let stdin = child.stdin.take().context("Failed to get MCP stdin")?;
             let stdout = child.stdout.take().context("Failed to get MCP stdout")?;
@@ -1802,5 +1886,36 @@ mod tests {
         let pool = McpPool::new(McpConfig::default());
         assert!(pool.server_names().is_empty());
         assert!(pool.all_tools().is_empty());
+    }
+
+    #[test]
+    fn mask_url_secrets_strips_userinfo() {
+        let masked = mask_url_secrets("https://user:s3cret@host.example/api?foo=bar");
+        assert!(masked.contains("***"), "expected masked userinfo: {masked}");
+        assert!(!masked.contains("s3cret"), "secret leaked: {masked}");
+        assert!(masked.contains("host.example"), "host preserved: {masked}");
+    }
+
+    #[test]
+    fn mask_url_secrets_passes_through_clean_url() {
+        assert_eq!(
+            mask_url_secrets("https://api.example.com/mcp"),
+            "https://api.example.com/mcp"
+        );
+    }
+
+    #[test]
+    fn redact_body_preview_masks_bearer_token() {
+        let redacted = redact_body_preview("Authorization: Bearer abc.def.ghi end");
+        assert!(redacted.contains("Bearer ***"), "redacted: {redacted}");
+        assert!(!redacted.contains("abc.def.ghi"), "leaked: {redacted}");
+    }
+
+    #[test]
+    fn redact_body_preview_masks_api_key_param() {
+        let redacted = redact_body_preview("error message api_key=sk-12345&other=val");
+        assert!(redacted.contains("api_key=***"), "redacted: {redacted}");
+        assert!(!redacted.contains("sk-12345"), "leaked: {redacted}");
+        assert!(redacted.contains("other=val"), "non-secret preserved: {redacted}");
     }
 }
