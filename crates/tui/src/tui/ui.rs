@@ -931,8 +931,37 @@ async fn run_event_loop(
             }
 
             if let Event::Resize(width, height) = evt {
+                tracing::debug!(width, height, "Event::Resize received; clearing terminal");
+                // Coalesce queued resize events so we only act on the final
+                // size. Rapid drag-resizes can produce many intermediate
+                // events; processing each one with its own clear+redraw
+                // amplifies the artifact window. Drain the queue here, keep
+                // only the final dimensions, and issue a single clear+draw.
+                let mut final_w = width;
+                let mut final_h = height;
+                while event::poll(Duration::from_millis(0)).unwrap_or(false) {
+                    match event::read() {
+                        Ok(Event::Resize(w, h)) => {
+                            final_w = w;
+                            final_h = h;
+                        }
+                        Ok(other) => {
+                            tracing::debug!(
+                                ?other,
+                                "non-resize event during resize coalesce; dropping"
+                            );
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
                 terminal.clear()?;
-                app.handle_resize(width, height);
+                app.handle_resize(final_w, final_h);
+                // Repaint immediately. Without this, the cleared screen can
+                // sit blank until the next event triggers another draw,
+                // which presents as a flicker or stale frame to the user.
+                terminal.draw(|f| render(f, app))?;
+                app.needs_redraw = false;
                 continue;
             }
 
@@ -3569,8 +3598,22 @@ pub(crate) fn truncate_line_to_width(text: &str, max_width: usize) -> String {
     if UnicodeWidthStr::width(text) <= max_width {
         return text.to_string();
     }
+    // For very small budgets, take chars until we exceed the *display* width.
+    // The previous implementation counted codepoints, which overran the
+    // budget for any double-width grapheme and contributed to mid-character
+    // sidebar artifacts on resize (issue #65).
     if max_width <= 3 {
-        return text.chars().take(max_width).collect();
+        let mut out = String::new();
+        let mut width = 0usize;
+        for ch in text.chars() {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if width + ch_width > max_width {
+                break;
+            }
+            out.push(ch);
+            width += ch_width;
+        }
+        return out;
     }
 
     let mut out = String::new();

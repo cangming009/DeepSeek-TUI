@@ -1653,4 +1653,88 @@ mod tests {
             "scrollbar should be visible for a long history"
         );
     }
+
+    /// Regression for issue #65: after `App::handle_resize`, the chat widget
+    /// must produce a clean render at the new width — no panic, and a
+    /// populated history must yield non-empty rendered cells. Cycling
+    /// through several widths (shrinks and grows) flushes any cached layout
+    /// that fails to invalidate on resize.
+    #[test]
+    fn chat_widget_renders_cleanly_after_resize_cycle() {
+        let mut app = create_test_app();
+        for i in 0..40 {
+            app.add_message(HistoryCell::User {
+                content: format!("user message {i} with enough text to wrap at 30 columns easily"),
+            });
+        }
+
+        let widths_to_cycle = [120u16, 80, 40, 60, 100, 30];
+        let height: u16 = 20;
+        for width in widths_to_cycle {
+            app.handle_resize(width, height);
+            let area = Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            let mut buf = Buffer::empty(area);
+            let widget = ChatWidget::new(&mut app, area);
+            widget.render(area, &mut buf);
+
+            let mut non_empty = 0usize;
+            for y in 0..height {
+                for x in 0..width {
+                    let sym = buf[(x, y)].symbol();
+                    if sym != " " && !sym.is_empty() {
+                        non_empty += 1;
+                    }
+                }
+            }
+            assert!(
+                non_empty > 0,
+                "render at {width}x{height} produced an empty buffer after resize"
+            );
+        }
+    }
+
+    /// Regression for issue #65: the transcript view cache must invalidate
+    /// when width changes, so the same `App.history` re-wraps at the new
+    /// width on the very next `ChatWidget::new` call.
+    #[test]
+    fn transcript_cache_invalidates_on_width_change() {
+        let mut app = create_test_app();
+        for i in 0..10 {
+            app.add_message(HistoryCell::User {
+                content: format!("a fairly long user message number {i} that needs to wrap"),
+            });
+        }
+
+        let area_wide = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 20,
+        };
+        let area_narrow = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 20,
+        };
+        let mut buf_wide = Buffer::empty(area_wide);
+        let widget_wide = ChatWidget::new(&mut app, area_wide);
+        widget_wide.render(area_wide, &mut buf_wide);
+        let wide_total_lines = app.transcript_cache.total_lines();
+
+        let mut buf_narrow = Buffer::empty(area_narrow);
+        let widget_narrow = ChatWidget::new(&mut app, area_narrow);
+        widget_narrow.render(area_narrow, &mut buf_narrow);
+        let narrow_total_lines = app.transcript_cache.total_lines();
+
+        assert!(
+            narrow_total_lines > wide_total_lines,
+            "narrow render should produce more wrapped lines (got {narrow_total_lines}, wide={wide_total_lines})"
+        );
+    }
 }

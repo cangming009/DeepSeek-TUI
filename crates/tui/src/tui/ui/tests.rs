@@ -1790,3 +1790,30 @@ fn second_thinking_block_appends_new_entry_in_same_active_cell() {
         "the group still hasn't flushed — no prose yet"
     );
 }
+
+/// Regression for issue #65: `truncate_line_to_width` with a tiny budget
+/// must respect display widths, not codepoint counts. The old branch counted
+/// chars and overran the budget for any double-width grapheme, which
+/// contributed to mid-character sidebar artifacts on resize.
+#[test]
+fn truncate_line_to_width_respects_display_width_for_tiny_budgets() {
+    use unicode_width::UnicodeWidthStr;
+
+    let trimmed = truncate_line_to_width("Agents", 3);
+    assert_eq!(trimmed, "Age");
+    assert!(UnicodeWidthStr::width(trimmed.as_str()) <= 3);
+
+    let trimmed_cjk = truncate_line_to_width("中文测试", 3);
+    assert!(
+        UnicodeWidthStr::width(trimmed_cjk.as_str()) <= 3,
+        "trimmed CJK width {} exceeded budget 3 (got {trimmed_cjk:?})",
+        UnicodeWidthStr::width(trimmed_cjk.as_str()),
+    );
+
+    assert_eq!(truncate_line_to_width("anything", 0), "");
+    assert_eq!(truncate_line_to_width("hi", 10), "hi");
+
+    let trimmed_long = truncate_line_to_width("a long sidebar label", 10);
+    assert!(trimmed_long.ends_with("..."));
+    assert!(UnicodeWidthStr::width(trimmed_long.as_str()) <= 10);
+}
