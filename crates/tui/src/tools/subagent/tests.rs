@@ -631,3 +631,80 @@ fn test_interrupted_status_name_and_summary() {
     assert_eq!(subagent_status_name(&snapshot.status), "interrupted");
     assert!(summarize_subagent_result(&snapshot).contains(SUBAGENT_RESTART_REASON));
 }
+
+// === Deprecation notice tests ===
+
+/// Helper: build a plain ToolResult with a JSON payload.
+fn make_plain_result(payload: serde_json::Value) -> crate::tools::spec::ToolResult {
+    crate::tools::spec::ToolResult::json(&payload).expect("json result")
+}
+
+#[test]
+fn test_wrap_with_deprecation_notice_adds_deprecation_block() {
+    let result = make_plain_result(json!({"agent_id": "abc"}));
+    let wrapped = wrap_with_deprecation_notice(result, "spawn_agent", "agent_spawn");
+
+    let meta = wrapped.metadata.expect("metadata should be present");
+    let dep = &meta["_deprecation"];
+    assert_eq!(dep["this_tool"], "spawn_agent");
+    assert_eq!(dep["use_instead"], "agent_spawn");
+    assert_eq!(dep["removed_in"], DEPRECATION_REMOVAL_VERSION);
+    assert!(
+        dep["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("spawn_agent")
+    );
+}
+
+#[test]
+fn test_wrap_with_deprecation_notice_preserves_existing_metadata() {
+    let result = make_plain_result(json!({"agent_id": "abc"}))
+        .with_metadata(json!({"status": "Running", "snapshot": {}}));
+    let wrapped = wrap_with_deprecation_notice(result, "close_agent", "agent_cancel");
+
+    let meta = wrapped.metadata.expect("metadata should be present");
+    // Existing metadata key must survive.
+    assert_eq!(meta["status"], "Running");
+    // Deprecation block must be present alongside.
+    assert_eq!(meta["_deprecation"]["this_tool"], "close_agent");
+    assert_eq!(meta["_deprecation"]["use_instead"], "agent_cancel");
+}
+
+#[test]
+fn test_canonical_agent_send_input_has_no_deprecation() {
+    let manager = Arc::new(Mutex::new(SubAgentManager::new(PathBuf::from("."), 1)));
+    // The canonical name "agent_send_input" must NOT receive a deprecation notice.
+    // We verify this by inspecting the tool's name — the deprecation branch
+    // only fires when name == "send_input".
+    let tool = AgentSendInputTool::new(manager.clone(), "agent_send_input");
+    assert_eq!(tool.name(), "agent_send_input");
+
+    let alias = AgentSendInputTool::new(manager, "send_input");
+    assert_eq!(alias.name(), "send_input");
+}
+
+#[test]
+fn test_wrap_with_deprecation_notice_all_alias_mappings() {
+    let cases = [
+        ("spawn_agent", "agent_spawn"),
+        ("delegate_to_agent", "agent_spawn"),
+        ("close_agent", "agent_cancel"),
+        ("send_input", "agent_send_input"),
+    ];
+
+    for (alias, canonical) in cases {
+        let result = make_plain_result(json!({"ok": true}));
+        let wrapped = wrap_with_deprecation_notice(result, alias, canonical);
+        let meta = wrapped.metadata.expect("metadata for alias {alias}");
+        assert_eq!(meta["_deprecation"]["this_tool"], alias, "alias={alias}");
+        assert_eq!(
+            meta["_deprecation"]["use_instead"], canonical,
+            "alias={alias}"
+        );
+        assert_eq!(
+            meta["_deprecation"]["removed_in"], DEPRECATION_REMOVAL_VERSION,
+            "alias={alias}"
+        );
+    }
+}

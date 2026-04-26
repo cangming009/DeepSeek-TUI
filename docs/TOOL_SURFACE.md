@@ -79,6 +79,37 @@ no longer pollute the model's tool list):
 - `close_agent` → use `agent_cancel`.
 - `assign_agent` → use `agent_assign`.
 
+## Deprecation schedule (v0.6.2 → v0.8.0)
+
+The alias tools below still execute successfully but now attach a
+`_deprecation` block to every result they return. Models should migrate to
+the canonical name before v0.8.0, when the aliases will be removed.
+
+| Deprecated alias | Canonical name | Warning since | Removal |
+|---|---|---|---|
+| `spawn_agent` | `agent_spawn` | v0.6.2 | v0.8.0 |
+| `delegate_to_agent` | `agent_spawn` | v0.6.2 | v0.8.0 |
+| `close_agent` | `agent_cancel` | v0.6.2 | v0.8.0 |
+| `send_input` | `agent_send_input` | v0.6.2 | v0.8.0 |
+
+The `_deprecation` block shape:
+
+```json
+{
+  "_deprecation": {
+    "this_tool": "spawn_agent",
+    "use_instead": "agent_spawn",
+    "removed_in": "0.8.0",
+    "message": "Tool 'spawn_agent' is deprecated; switch to 'agent_spawn' before v0.8.0."
+  }
+}
+```
+
+This block is merged into the tool result's `metadata` object alongside any
+other metadata keys (e.g. `status`, `timed_out`) so it does not displace
+existing metadata.  A one-line deprecation warning is also emitted to the
+audit log at `tracing::warn` level every time an alias is invoked.
+
 ## Why we don't ship a single `bash` tool
 
 Single-`bash` agents (Claude Code's design) are powerful but hand the model

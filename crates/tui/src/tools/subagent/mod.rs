@@ -52,10 +52,65 @@ const MAX_CSV_MAX_RUNTIME_SECONDS: u64 = 86_400;
 const VALID_SUBAGENT_TYPES: &str =
     "general, explore, plan, review, custom, worker, explorer, awaiter, default";
 
+/// Removal version for deprecated tool aliases.
+const DEPRECATION_REMOVAL_VERSION: &str = "0.8.0";
+
 static AGENT_JOB_REPORTS: OnceLock<StdMutex<HashMap<String, HashMap<String, AgentJobReport>>>> =
     OnceLock::new();
 static AGENT_JOB_ASSIGNMENTS: OnceLock<StdMutex<HashMap<String, HashMap<String, String>>>> =
     OnceLock::new();
+
+// === Deprecation helpers ===
+
+/// Wrap a `ToolResult` with a `_deprecation` block in its metadata.
+///
+/// Applied exclusively on alias paths (not on canonical tool names) so the
+/// model can detect and migrate away from the old name before removal in
+/// v`DEPRECATION_REMOVAL_VERSION`.
+///
+/// The `_deprecation` key is merged into any existing metadata so other
+/// metadata (e.g. `status`, `timed_out`) is preserved unchanged.
+fn wrap_with_deprecation_notice(
+    mut result: ToolResult,
+    this_tool: &str,
+    use_instead: &str,
+) -> ToolResult {
+    tracing::warn!(
+        "Deprecated tool '{}' invoked — use '{}' instead (removal: v{})",
+        this_tool,
+        use_instead,
+        DEPRECATION_REMOVAL_VERSION,
+    );
+
+    let notice = json!({
+        "_deprecation": {
+            "this_tool": this_tool,
+            "use_instead": use_instead,
+            "removed_in": DEPRECATION_REMOVAL_VERSION,
+            "message": format!(
+                "Tool '{}' is deprecated; switch to '{}' before v{}.",
+                this_tool, use_instead, DEPRECATION_REMOVAL_VERSION
+            )
+        }
+    });
+
+    result.metadata = Some(match result.metadata.take() {
+        Some(Value::Object(mut map)) => {
+            if let Value::Object(notice_map) = notice {
+                map.extend(notice_map);
+            }
+            Value::Object(map)
+        }
+        Some(other) => {
+            // Existing metadata was not an object — keep it as-is and add
+            // the deprecation notice as a sibling under a wrapper.
+            json!({ "_deprecation": notice["_deprecation"].clone(), "_original_metadata": other })
+        }
+        None => notice,
+    });
+
+    result
+}
 
 // === Types ===
 
@@ -1113,6 +1168,11 @@ impl ToolSpec for AgentSpawnTool {
                 tool_result.metadata = Some(json!({ "status": "Running" }));
             }
         }
+        // Annotate alias invocations with a deprecation notice so the model
+        // can migrate to the canonical name before removal in v0.8.0.
+        if self.name == "spawn_agent" {
+            tool_result = wrap_with_deprecation_notice(tool_result, "spawn_agent", "agent_spawn");
+        }
         Ok(tool_result)
     }
 }
@@ -1329,7 +1389,13 @@ impl ToolSpec for AgentCloseTool {
         let result = manager
             .cancel(agent_id)
             .map_err(|e| ToolError::execution_failed(format!("Failed to close sub-agent: {e}")))?;
-        ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))
+        let tool_result =
+            ToolResult::json(&result).map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        Ok(wrap_with_deprecation_notice(
+            tool_result,
+            "close_agent",
+            "agent_cancel",
+        ))
     }
 }
 
@@ -1520,7 +1586,19 @@ impl ToolSpec for AgentSendInputTool {
             .get_result(agent_id)
             .map_err(|e| ToolError::execution_failed(e.to_string()))?;
 
-        ToolResult::json(&snapshot).map_err(|e| ToolError::execution_failed(e.to_string()))
+        let tool_result =
+            ToolResult::json(&snapshot).map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        // Annotate the alias name "send_input" with a deprecation notice;
+        // the canonical name "agent_send_input" passes through unchanged.
+        if self.name == "send_input" {
+            Ok(wrap_with_deprecation_notice(
+                tool_result,
+                "send_input",
+                "agent_send_input",
+            ))
+        } else {
+            Ok(tool_result)
+        }
     }
 }
 
@@ -1853,7 +1931,12 @@ impl ToolSpec for DelegateToAgentTool {
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let spawn_tool = AgentSpawnTool::new(self.manager.clone(), self.runtime.clone());
-        spawn_tool.execute(input, context).await
+        let result = spawn_tool.execute(input, context).await?;
+        Ok(wrap_with_deprecation_notice(
+            result,
+            "delegate_to_agent",
+            "agent_spawn",
+        ))
     }
 }
 
