@@ -348,7 +348,7 @@ impl ToolCell {
             ToolCell::Mcp(cell) => cell.render(width, low_motion, mode),
             ToolCell::ViewImage(cell) => cell.lines_with_motion(width, low_motion),
             ToolCell::WebSearch(cell) => cell.lines_with_motion(width, low_motion),
-            ToolCell::Generic(cell) => cell.lines_with_motion(width, low_motion),
+            ToolCell::Generic(cell) => cell.lines_with_mode(width, low_motion, mode),
         }
     }
 }
@@ -906,7 +906,16 @@ pub struct GenericToolCell {
 
 impl GenericToolCell {
     /// Render the generic tool cell into lines.
-    pub fn lines_with_motion(&self, width: u16, low_motion: bool) -> Vec<Line<'static>> {
+    ///
+    /// `mode` controls multi-line output handling: `Live` caps at
+    /// `TOOL_OUTPUT_LINE_LIMIT` rows with a "+N more" affordance;
+    /// `Transcript` emits the full output.
+    pub fn lines_with_mode(
+        &self,
+        width: u16,
+        low_motion: bool,
+        mode: RenderMode,
+    ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         lines.push(render_tool_header(
             "Tool",
@@ -953,11 +962,16 @@ impl GenericToolCell {
         }
 
         if let Some(output) = self.output.as_ref() {
-            lines.extend(render_compact_kv(
-                "result",
+            // Multi-line outputs (diff stats, file lists, todo snapshots) used
+            // to be crushed into one line by `render_compact_kv` because its
+            // wrapper joined the entire string before wrapping. Route through
+            // `render_tool_output_mode` so each `\n` becomes a real row, with
+            // a `+N more lines` affordance in live mode (#80).
+            lines.extend(render_tool_output_mode(
                 output,
-                tool_value_style(),
                 width,
+                TOOL_OUTPUT_LINE_LIMIT,
+                mode,
             ));
         }
         lines
@@ -2251,5 +2265,93 @@ mod tests {
         }));
         let text = lines_text(&cell.lines(80));
         assert!(text.contains("query: foo"));
+    }
+
+    #[test]
+    fn generic_tool_cell_preserves_multi_line_output_in_transcript() {
+        // Repro for #80: a `git diff --stat`-shaped tool result should keep
+        // its newlines on the transcript surface — one file per row, not
+        // squashed into a single line.
+        let diff_stat = "Cargo.lock                |  1 +\n\
+                         crates/cli/Cargo.toml     |  1 +\n\
+                         crates/cli/src/main.rs    | 47 ++++++\n\
+                         crates/config/src/lib.rs  | 27 ++++\n\
+                         crates/tui/src/mcp.rs     | 384 +++++";
+
+        let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "exec_shell".to_string(),
+            status: ToolStatus::Success,
+            input_summary: Some("command: git diff --stat".to_string()),
+            output: Some(diff_stat.to_string()),
+            prompts: None,
+        }));
+
+        let transcript_text = lines_text(&cell.transcript_lines(80));
+
+        // Each file path must appear on its own row in the transcript.
+        for needle in [
+            "Cargo.lock",
+            "crates/cli/Cargo.toml",
+            "crates/cli/src/main.rs",
+            "crates/config/src/lib.rs",
+            "crates/tui/src/mcp.rs",
+        ] {
+            assert!(
+                transcript_text.contains(needle),
+                "transcript missing '{needle}': {transcript_text}"
+            );
+        }
+        // The pre-fix bug: result line containing
+        // "Cargo.lock | 1 + crates/cli/Cargo.toml" — joined into one row.
+        // With the fix, the diff-stat pipes are still present per-line, but
+        // adjacent file paths are on separate rendered rows. Assert that the
+        // first file's line ends before the second begins.
+        let lines: Vec<&str> = transcript_text.lines().collect();
+        let cargo_lock_line = lines
+            .iter()
+            .find(|l| l.contains("Cargo.lock"))
+            .expect("Cargo.lock row must exist");
+        assert!(
+            !cargo_lock_line.contains("crates/cli/Cargo.toml"),
+            "Cargo.lock row must not also contain the second file: {cargo_lock_line}"
+        );
+    }
+
+    #[test]
+    fn generic_tool_cell_caps_multi_line_output_in_live_with_affordance() {
+        // Live (in-progress / active-cell) view caps long output at
+        // TOOL_OUTPUT_LINE_LIMIT (=6) and shows a "+N more lines" affordance.
+        let total = 30usize;
+        let output = (0..total)
+            .map(|i| format!("row {i:02}: payload"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "exec_shell".to_string(),
+            status: ToolStatus::Success,
+            input_summary: Some("command: ls".to_string()),
+            output: Some(output),
+            prompts: None,
+        }));
+
+        let live = cell.lines_with_options(80, TranscriptRenderOptions::default());
+        let transcript = cell.transcript_lines(80);
+
+        assert!(
+            live.len() < transcript.len(),
+            "live generic-tool output must be shorter than transcript (live={}, transcript={})",
+            live.len(),
+            transcript.len(),
+        );
+        let live_text = lines_text(&live);
+        assert!(
+            live_text.contains("press v for details"),
+            "live view must show pager affordance: {live_text}"
+        );
+        // First line shows up in both; later rows only in transcript.
+        assert!(live_text.contains("row 00"));
+        let transcript_text = lines_text(&transcript);
+        assert!(transcript_text.contains("row 29"));
     }
 }
