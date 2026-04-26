@@ -18,14 +18,33 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Repo-aware resolver for `@`-mentions and file pickers.
-#[derive(Debug, Clone)]
+///
+/// `cwd` is captured at construction; if the host's current directory changes
+/// during a session, build a fresh `Workspace`. Fuzzy lookups are backed by a
+/// lazy basename → paths index built once on first miss and reused for the
+/// rest of the session — without it, every mis-typed mention triggered a full
+/// `WalkBuilder` traversal up to depth 6 (Gemini code-review feedback).
+#[derive(Debug)]
 pub struct Workspace {
     pub root: PathBuf,
+    cwd: Option<PathBuf>,
+    file_index: OnceLock<HashMap<String, Vec<PathBuf>>>,
 }
 
 impl Workspace {
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self::with_cwd(root, std::env::current_dir().ok())
+    }
+
+    /// Construct with an explicit cwd. Used by tests that need deterministic
+    /// resolution against a known directory without depending on (and
+    /// mutating) the process's real working directory.
+    pub fn with_cwd(root: PathBuf, cwd: Option<PathBuf>) -> Self {
+        Self {
+            root,
+            cwd,
+            file_index: OnceLock::new(),
+        }
     }
 
     /// Two-pass resolution: workspace, then cwd, then fuzzy fallback.
@@ -43,14 +62,13 @@ impl Workspace {
             return Ok(ws_path);
         }
 
-        if let Ok(cwd) = std::env::current_dir() {
+        if let Some(cwd) = self.cwd.as_ref() {
             let cwd_path = cwd.join(&path);
             if cwd_path.exists() {
                 return Ok(cwd_path);
             }
         }
 
-        // Fuzzy fallback
         if let Some(fuzzy) = self.fuzzy_resolve(&path) {
             return Ok(fuzzy);
         }
@@ -64,17 +82,40 @@ impl Workspace {
             return None;
         }
 
+        let index = self.file_index.get_or_init(|| self.build_file_index());
+        index.get(&needle).and_then(|paths| paths.first()).cloned()
+    }
+
+    fn build_file_index(&self) -> HashMap<String, Vec<PathBuf>> {
+        let mut index: HashMap<String, Vec<PathBuf>> = HashMap::new();
         let mut builder = WalkBuilder::new(&self.root);
         builder.hidden(true).follow_links(false).max_depth(Some(6));
 
         for entry in builder.build().flatten() {
-            if entry.file_type().map_or(false, |ft| ft.is_file()) {
-                if entry.file_name().to_string_lossy().to_lowercase() == needle {
-                    return Some(entry.path().to_path_buf());
-                }
+            if entry
+                .file_type()
+                .is_some_and(|ft| ft.is_file() || ft.is_dir())
+            {
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                index
+                    .entry(name)
+                    .or_default()
+                    .push(entry.path().to_path_buf());
             }
         }
-        None
+        index
+    }
+}
+
+impl Clone for Workspace {
+    fn clone(&self) -> Self {
+        // Don't carry the cached file_index — clones get a fresh OnceLock so
+        // they don't pin a stale snapshot of the previous owner's tree.
+        Self {
+            root: self.root.clone(),
+            cwd: self.cwd.clone(),
+            file_index: OnceLock::new(),
+        }
     }
 }
 
@@ -869,31 +910,51 @@ mod tests {
     #[test]
     fn workspace_resolve_respects_cwd_and_workspace() {
         let tmp = TempDir::new().unwrap();
-        let ws = Workspace::new(tmp.path().to_path_buf());
-        
+
         let sub = tmp.path().join("sub");
         std::fs::create_dir_all(&sub).unwrap();
-        
         let bar = sub.join("bar.txt");
         std::fs::write(&bar, "bar").unwrap();
-        
+
         let nested = tmp.path().join("nested/deep");
         std::fs::create_dir_all(&nested).unwrap();
         let file_md = nested.join("file.md");
         std::fs::write(&file_md, "md").unwrap();
 
-        // Simulate CWD being /tmp/foo/sub
-        let old_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&sub).unwrap();
-        
-        // Test 1: type @bar.txt from sub/ -> should resolve to sub/bar.txt
+        // Construct with an explicit cwd so the test doesn't race with other
+        // tests that mutate the real process cwd.
+        let ws = Workspace::with_cwd(tmp.path().to_path_buf(), Some(sub.clone()));
+
+        // Test 1: @bar.txt with cwd=sub → resolves via the cwd pass.
         let res1 = ws.resolve("bar.txt").unwrap();
-        assert_eq!(res1.canonicalize().unwrap_or(res1), bar.canonicalize().unwrap_or(bar));
-        
-        // Test 2: type @nested/deep/file.md from sub/ -> should fall back to workspace root
+        assert_eq!(
+            res1.canonicalize().unwrap_or(res1),
+            bar.canonicalize().unwrap_or(bar)
+        );
+
+        // Test 2: @nested/deep/file.md → falls through to workspace root.
         let res2 = ws.resolve("nested/deep/file.md").unwrap();
-        assert_eq!(res2.canonicalize().unwrap_or(res2), file_md.canonicalize().unwrap_or(file_md));
-        
-        std::env::set_current_dir(old_cwd).unwrap();
+        assert_eq!(
+            res2.canonicalize().unwrap_or(res2),
+            file_md.canonicalize().unwrap_or(file_md)
+        );
+    }
+
+    #[test]
+    fn fuzzy_index_finds_files_and_directories() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("a/b/target_dir")).unwrap();
+        std::fs::write(tmp.path().join("a/b/needle.rs"), "fn main(){}").unwrap();
+
+        let ws = Workspace::with_cwd(tmp.path().to_path_buf(), None);
+
+        // Basename-only mention triggers fuzzy fallback for both files and dirs.
+        let f = ws.resolve("needle.rs").unwrap();
+        assert!(f.ends_with("a/b/needle.rs"));
+        let d = ws.resolve("target_dir").unwrap();
+        assert!(d.ends_with("a/b/target_dir"));
+
+        // Index was populated exactly once (subsequent lookups reuse it).
+        assert!(ws.file_index.get().is_some());
     }
 }
